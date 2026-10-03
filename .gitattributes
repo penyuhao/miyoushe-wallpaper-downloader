@@ -1,0 +1,29 @@
+# 统一换行符，避免跨平台克隆后文件被改写
+#
+# 批处理文件必须是 CRLF：cmd.exe 的批处理解析器遇到纯 LF 会从行首截断命令，
+# 表现为 "'ython' is not recognized" 之类的怪错。所以这里强制锁定。
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 其余文本文件统一 LF
+*.py    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+
+# 二进制文件不要做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.zip  binary
+*.exe  binary
+
+# 语言统计：把 HTML 里的中文界面也算进去
+*.html linguist-detectable=true

@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-米游社壁纸下载器 v3.1
+米游社壁纸下载器 v3.1.1
 纯 Python 标准库实现，零第三方依赖，装好 Python 直接跑。
+
+v3.1.1 更新
+  * 并发硬上限从 512 降到 32：512 个 OS 线程足以把机器拖到近乎假死，
+    且实测该图站在 8 线程最快，超过 16 就没有收益
+  * 并发数改为服务端权威收敛：不管前端传什么（哪怕是旧 localStorage 里的 512），
+    都会被 clamp_threads() 收敛，并按可用内存 / 系统内存占用二次缩放
+  * 界面档位收敛为 4 / 8 / 16 / 32，去掉 64~512
 
 v3.1 更新
   * 扫描并行化：利用 offset=<帖子ID> 的游标语义，多起点并行下潜抓取，
@@ -11,7 +18,7 @@ v3.1 更新
   * 去掉翻页之间 0.3s 的人为等待
 
 v3.0 更新
-  * 多线程并发下载：默认 8 线程，界面最高可拉到 512，按待下载图片数自动收敛
+  * 多线程并发下载：默认 8 线程，按待下载图片数自动收敛
   * 断点续传加固：先写 .part 临时文件再原子改名，半截文件不会被当成"已下载"
   * 修复统计错误：跳过/失败不再被算进"已下载"
   * 日志增量拉取：按 seq 游标只取新增
@@ -35,7 +42,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 
-VERSION = "3.1"
+VERSION = "3.1.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SAVE_DIR = os.path.join(BASE_DIR, "wallpapers")
@@ -47,12 +54,16 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PAGE_SIZE = 20                 # 接口硬上限，传更大也会被忽略
 MAX_RETRY = 3
 DEFAULT_THREADS = 8
-MAX_THREADS = 512              # 下载并发上限；实际线程数会被"待下载图片数"钳制
-HIGH_THREADS = 128             # 超过这个值给出提醒
+# 并发硬上限。参考 AB Download Manager（defaultThreadCount = 8、
+# maxConcurrentDownloads = 3）的做法：默认值要小，且上限必须由程序锁死。
+# 实测该图站 8 线程最快，超过 16 吞吐反而下降；512 个 OS 线程足以把机器拖到假死。
+MAX_THREADS = 32
+SOFT_THREADS = 16              # 超过这个值属于"不推荐"区间
 MAX_SCAN_THREADS = 16          # 扫描并发上限（接口比图床更敏感，别太猛）
 MAX_PROBES = 600               # 并行扫描的请求总数上限，超出则回退顺序扫描
 MIN_VALID_BYTES = 1024
 LOG_LIMIT = 1000
+THREAD_MEMORY_MB = 4           # 单个下载线程的粗略内存开销（栈 + TLS 缓冲 + 帧）
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
@@ -80,6 +91,7 @@ state = {
     "failed_images": 0,
     "downloaded_bytes": 0,
     "threads": DEFAULT_THREADS,
+    "clamp_reason": None,        # 并发数被自动收敛时的原因
     "scan_mode": "",             # parallel / sequential
     "save_dir": DEFAULT_SAVE_DIR,
     "started_at": 0.0,
@@ -116,6 +128,81 @@ def _bump(**deltas):
 
 def _busy():
     return state["status"] in ("fetching", "downloading")
+
+
+# --------------------------------------------------------------------------- #
+# 并发数收敛
+#
+# 参考 AB Download Manager 的设计：默认连接数取 8、同时下载数取 3，
+# 并且每个设置项都有 schema 级取值范围约束，界面上根本设不出离谱的值。
+# 这里同样把上限锁在程序里，而不是信任前端传来的数字。
+# --------------------------------------------------------------------------- #
+
+def memory_status():
+    """返回 (可用物理内存 MB, 系统内存占用百分比)；取不到就返回 None。"""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return (int(status.ullAvailPhys // (1024 * 1024)),
+                        int(status.dwMemoryLoad))
+        except Exception:
+            return None
+        return None
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        size = os.sysconf("SC_PAGE_SIZE")
+        return (int(pages * size // (1024 * 1024)), None)
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def clamp_threads(requested, max_threads=MAX_THREADS):
+    """把并发数收敛到安全区间，返回 (最终值, 收敛原因或 None)。
+
+    三重收敛：硬上限 -> 内存压力 -> 至少 1。
+    前端可能传来任何数字（旧版本 localStorage 里甚至存着 512），
+    所以服务端必须自己兜底，不能信客户端。
+    """
+    try:
+        wanted = int(requested)
+    except (TypeError, ValueError):
+        wanted = DEFAULT_THREADS
+
+    reason = None
+    if wanted > max_threads:
+        reason = "超过硬上限 %d" % max_threads
+    wanted = max(1, min(max_threads, wanted))
+
+    mem = memory_status()
+    if mem:
+        avail_mb, load_pct = mem
+        if load_pct is not None and load_pct >= 85 and wanted > 4:
+            reason = "系统内存已占用 %d%%" % load_pct
+            wanted = 4
+        else:
+            by_mem = max(2, avail_mb // THREAD_MEMORY_MB)
+            if by_mem < wanted:
+                reason = "可用物理内存仅 %d MB" % avail_mb
+                wanted = by_mem
+
+    return wanted, reason
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +597,13 @@ def _sequential_scan(uid):
 def fetch_posts(uid, threads):
     try:
         add_log("开始扫描用户 %s 的帖子…" % uid, "info")
+        if state.get("clamp_reason"):
+            add_log("并发数已自动收敛到 %d（%s），上限 %d"
+                    % (threads, state["clamp_reason"], MAX_THREADS), "warning")
+        scan_workers = max(2, min(threads, MAX_SCAN_THREADS))
+        if scan_workers != threads:
+            add_log("扫描阶段实际使用 %d 路并发探测（扫描上限 %d）"
+                    % (scan_workers, MAX_SCAN_THREADS), "info")
         t0 = time.time()
 
         with _state_lock:
@@ -640,9 +734,12 @@ def download_posts(posts, save_dir, naming_mode, threads):
 
         add_log("开始下载 %d 个帖子 / %d 张图片，请求并发 %d 线程"
                 % (total_posts, total_images, threads), "info")
-        if threads >= HIGH_THREADS:
-            add_log("并发 %d 偏高：实测该图站按 IP 限速，并发越大单连接越慢，"
-                    "建议调回 8~16" % threads, "warning")
+        if state.get("clamp_reason"):
+            add_log("并发数已自动收敛到 %d（%s），上限 %d"
+                    % (threads, state["clamp_reason"], MAX_THREADS), "warning")
+        if threads > SOFT_THREADS:
+            add_log("并发 %d 超出推荐区间：该图站按 IP 限速，线程越多单连接越慢，"
+                    "8~16 才是最快档位" % threads, "warning")
 
         tasks = []
         progress = {}
@@ -926,6 +1023,7 @@ class WallpaperHandler(http.server.BaseHTTPRequestHandler):
                 "save_dir": DEFAULT_SAVE_DIR,
                 "default_threads": DEFAULT_THREADS,
                 "max_threads": MAX_THREADS,
+                "soft_threads": SOFT_THREADS,
                 "max_scan_threads": MAX_SCAN_THREADS,
             })
 
@@ -947,10 +1045,10 @@ class WallpaperHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             try:
-                threads = int(data.get("threads") or DEFAULT_THREADS)
+                wanted_threads = int(data.get("threads") or DEFAULT_THREADS)
             except (TypeError, ValueError):
-                threads = DEFAULT_THREADS
-            threads = max(1, min(MAX_THREADS, threads))
+                wanted_threads = DEFAULT_THREADS
+            threads, clamp_reason = clamp_threads(wanted_threads)
 
             _stop_event.clear()
             with _state_lock:
@@ -958,6 +1056,7 @@ class WallpaperHandler(http.server.BaseHTTPRequestHandler):
                 state["run_id"] += 1
                 state["logs"] = []
                 state["target"] = uid
+                state["clamp_reason"] = clamp_reason
                 state["wallpaper_posts"] = []
                 state["total_posts"] = 0
                 state["total_images"] = 0
@@ -980,10 +1079,10 @@ class WallpaperHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             try:
-                threads = int(data.get("threads") or DEFAULT_THREADS)
+                wanted_threads = int(data.get("threads") or DEFAULT_THREADS)
             except (TypeError, ValueError):
-                threads = DEFAULT_THREADS
-            threads = max(1, min(MAX_THREADS, threads))
+                wanted_threads = DEFAULT_THREADS
+            threads, clamp_reason = clamp_threads(wanted_threads)
 
             naming_mode = data.get("naming_mode") or "date_title"
             if naming_mode not in ("date_title", "date", "id"):
@@ -1030,6 +1129,7 @@ class WallpaperHandler(http.server.BaseHTTPRequestHandler):
                 state["run_id"] += 1
                 state["logs"] = []
                 state["save_dir"] = save_dir
+                state["clamp_reason"] = clamp_reason
                 state["workers"] = []
                 state["worker_count"] = 0
                 state["workers_version"] += 1

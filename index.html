@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>米游社壁纸下载器 v3.1</title>
+<title>米游社壁纸下载器 v3.1.1</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='88'>🎨</text></svg>">
 <style>
 :root{
@@ -209,10 +209,6 @@ input[type=range]::-moz-range-thumb{
   color:#fff;border-color:transparent;box-shadow:0 4px 14px rgba(124,140,255,.35);
 }
 .presets button:disabled{opacity:.45;cursor:not-allowed}
-.presets button.extreme.active{
-  background:linear-gradient(135deg,#ff7a59,#e0334f);
-  box-shadow:0 4px 14px rgba(224,51,79,.4);
-}
 .thintag{
   margin-top:11px;font-size:12px;line-height:1.5;
   border-radius:9px;padding:8px 11px;
@@ -421,17 +417,15 @@ input[type=range]::-moz-range-thumb{
             <span class="slider-val" id="threadsVal">8 线程</span>
           </div>
           <div class="presets" id="threadPresets">
+            <button type="button" data-v="4">4</button>
             <button type="button" data-v="8">8</button>
+            <button type="button" data-v="16">16</button>
             <button type="button" data-v="32">32</button>
-            <button type="button" data-v="64">64</button>
-            <button type="button" data-v="128">128</button>
-            <button type="button" data-v="256" class="extreme">256</button>
-            <button type="button" data-v="512" class="extreme">512</button>
           </div>
           <div class="thintag" id="threadTag"></div>
           <div class="hint" style="margin-top:9px">
-            对数刻度滑杆，上限 512。扫描阶段最多用 16 路并发探测；
-            下载阶段实测本图站按 IP 限速，并发越高单连接越慢，8~16 最快。
+            上限 32 由服务端写死，前端传更大的值也会被收敛。
+            参考 AB Download Manager 的做法：默认连接数取 8，且设置项必须有硬性范围。
           </div>
         </div>
       </div>
@@ -577,8 +571,9 @@ input[type=range]::-moz-range-thumb{
     $('rangeRow').classList.toggle('on', current('dateMode') === 'range');
   }
 
-  /* 并发线程：滑杆用对数刻度（0~100 位置映射到 1~tMax） */
-  let tMax = 512;
+  /* 并发线程：滑杆用对数刻度（0~100 位置映射到 1~tMax）
+     tMax 会被 /api/config 的 max_threads 覆盖，服务端才是最终权威 */
+  let tMax = 32;
 
   function sliderToThreads(pos) {
     return Math.max(1, Math.min(tMax, Math.round(Math.pow(tMax, pos / 100))));
@@ -603,15 +598,15 @@ input[type=range]::-moz-range-thumb{
     });
 
     const tag = $('threadTag');
-    if (n <= 16) {
+    if (n <= 8) {
       tag.className = 'thintag';
-      tag.textContent = '✅ 推荐档位：实测约 30~55 MB/s';
-    } else if (n <= 64) {
+      tag.textContent = '✅ 推荐：实测该图站 8 线程最快，与 AB Download Manager 的默认值一致';
+    } else if (n <= 16) {
       tag.className = 'thintag warn';
-      tag.textContent = '⚠️ 实测吞吐下降约一半（约 10~20 MB/s）';
+      tag.textContent = '⚠️ 实测吞吐已开始下降（约为 8 线程的一半）';
     } else {
       tag.className = 'thintag err';
-      tag.textContent = '🐌 实测明显更慢，256 以上常出现长时间无响应，慎用';
+      tag.textContent = '🐌 上限区：实测比 8 线程慢 5 倍以上，且明显更吃系统资源';
     }
 
     try { localStorage.setItem('miyoushe.threads', String(n)); } catch (e) { /* 隐私模式下忽略 */ }
